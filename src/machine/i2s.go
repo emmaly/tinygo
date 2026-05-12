@@ -1,4 +1,4 @@
-//go:build sam && atsamd21
+//go:build (sam && atsamd21) || esp32
 
 // This is the definition for I2S bus functions.
 // Actual implementations if available for any given hardware
