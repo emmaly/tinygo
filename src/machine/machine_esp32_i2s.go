@@ -148,17 +148,34 @@ func (i2s *I2S) Configure(config I2SConfig) error {
 	// streaming as long as descriptors are queued.
 	i2s.Bus.SetCONF1_TX_STOP_EN(0)
 
-	// FIFO: 16-bit single channel data, dual-channel framing.
-	// FIFO_MOD = 0 means 16-bit per sample with single-channel data
-	// path; the DMA delivers 32-bit words containing two 16-bit slots.
-	i2s.Bus.SetFIFO_CONF_TX_FIFO_MOD(0)
+	// Force into standard I2S framing. After reset CONF2 and PDM_CONF
+	// may carry stale bits that route the TX path through the parallel
+	// LCD or PDM data paths; without explicitly clearing them the FIFO
+	// is wired to the wrong output. This matches ESP-IDF's
+	// i2s_ll_tx_enable_std / i2s_ll_rx_enable_std for the ESP32.
+	i2s.Bus.CONF2.Set(0)
+	i2s.Bus.SetPDM_CONF_TX_PDM_EN(0)
+	i2s.Bus.SetPDM_CONF_PCM2PDM_CONV_EN(0)
+	i2s.Bus.SetPDM_CONF_RX_PDM_EN(0)
+	i2s.Bus.SetPDM_CONF_PDM2PCM_CONV_EN(0)
+
+	// FIFO: 16-bit mono mode. tx_fifo_mod=1 selects 16-bit mono so the
+	// DMA-supplied 32-bit word carries a single 16-bit sample (high
+	// half ignored by hardware) and the peripheral duplicates / steers
+	// onto whichever I2S slot is selected by CONF_CHAN.TX_CHAN_MOD.
+	// This matches the M5Stack Atom Echo Arduino driver, which uses
+	// I2S_CHANNEL_FMT_ONLY_RIGHT to feed the NS4168 amp that listens on
+	// the right channel.
+	i2s.Bus.SetFIFO_CONF_TX_FIFO_MOD(1)
 	i2s.Bus.SetFIFO_CONF_TX_FIFO_MOD_FORCE_EN(1)
 	i2s.Bus.SetFIFO_CONF_DSCR_EN(1)
 	i2s.Bus.SetFIFO_CONF_TX_DATA_NUM(32)
 	i2s.Bus.SetFIFO_CONF_RX_DATA_NUM(32)
 
-	// CONF_CHAN: 16 bits per sample, dual-channel.
-	i2s.Bus.SetCONF_CHAN_TX_CHAN_MOD(0)
+	// CONF_CHAN: TX_CHAN_MOD = 1 = output mono samples on the right
+	// slot of the stereo I2S frame. ESP-IDF's i2s_ll_tx_select_std_slot
+	// uses the same value for non-mono I2S_STD_SLOT_RIGHT.
+	i2s.Bus.SetCONF_CHAN_TX_CHAN_MOD(1)
 	i2s.Bus.SetCONF_CHAN_RX_CHAN_MOD(0)
 	i2s.Bus.SetSAMPLE_RATE_CONF_TX_BITS_MOD(16)
 	i2s.Bus.SetSAMPLE_RATE_CONF_RX_BITS_MOD(16)
@@ -256,6 +273,10 @@ func (i2s *I2S) WriteMono(b []uint16) (int, error) {
 		if samplesThisRound > len(b)-written {
 			samplesThisRound = len(b) - written
 		}
+		// FIFO_MOD=1 (16-bit mono) consumes one 16-bit sample per
+		// 32-bit DMA word; the upper 16 bits are ignored, but we
+		// duplicate them so a future switch to FIFO_MOD=0 dual
+		// channel doesn't change the audio.
 		for i := 0; i < samplesThisRound; i++ {
 			s := uint32(b[written+i])
 			frame := (s << 16) | s
@@ -326,15 +347,23 @@ func (i2s *I2S) txSignals() (bck, ws, data uint32) {
 }
 
 func (i2s *I2S) armOutLink() {
-	// Point OUTLINK at our descriptor and start it in a single register
-	// write. The hardware latches start/restart/addr together; splitting
-	// the assignment across multiple RMW writes can leave the DMA
-	// controller seeing an inconsistent OUT_LINK register and flag
-	// OUT_DSCR_ERR.
+	// Match the canonical ESP-IDF tx-channel start sequence: reset TX
+	// path + FIFO, re-enable the OUT_EOF interrupt status path, then
+	// program OUT_LINK.addr | start in one combined write. Splitting
+	// addr/start writes can leave OUT_LINK inconsistent (DMA flagged
+	// OUT_DSCR_ERR during early bring-up); writing the field-bundle
+	// together avoids it.
+	i2s.Bus.SetCONF_TX_RESET(1)
+	i2s.Bus.SetCONF_TX_RESET(0)
+	i2s.Bus.SetLC_CONF_OUT_RST(1)
+	i2s.Bus.SetLC_CONF_OUT_RST(0)
+	i2s.Bus.SetCONF_TX_FIFO_RESET(1)
+	i2s.Bus.SetCONF_TX_FIFO_RESET(0)
+	i2s.Bus.SetINT_ENA_OUT_EOF_INT_ENA(1)
+	i2s.Bus.SetFIFO_CONF_DSCR_EN(1)
 	addr := uint32(uintptr(unsafe.Pointer(&i2s.dma))) & 0xfffff
 	const outLinkStart = uint32(1 << 29)
 	i2s.Bus.OUT_LINK.Set(addr | outLinkStart)
-	// Clear pending EOF status so waitTXEOF sees only fresh events.
 	i2s.Bus.SetINT_CLR_OUT_EOF_INT_CLR(1)
 	i2s.Bus.SetINT_CLR_OUT_DSCR_ERR_INT_CLR(1)
 }
