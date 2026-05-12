@@ -26,9 +26,10 @@ type I2S struct {
 	id   uint8 // 0 = I2S0, 1 = I2S1
 	conf I2SConfig
 
-	dma     i2sDMADesc
-	dmaBuf  [i2sDMABufBytes]byte
-	dmaBusy bool
+	dma       i2sDMADesc
+	dmaBuf    [i2sDMABufBytes]byte
+	dmaBusy   bool
+	dmaPrimed bool
 }
 
 // i2sDMABufBytes is the on-chip buffer used by a single DMA descriptor.
@@ -58,21 +59,22 @@ const (
 	i2sDescEOF      uint32 = 1 << 30
 )
 
-// Peripheral signal indices on the GPIO matrix. Values are documented
-// in the ESP32 TRM Table 4-2 and ESP-IDF's gpio_sig_map.h.
+// Peripheral signal indices on the GPIO matrix, per ESP-IDF's
+// components/soc/esp32/include/soc/gpio_sig_map.h.
+//
+// Master TX uses the I2S0O_* / I2S1O_* index family: the peripheral
+// drives BCK, WS and DATA out on these signal numbers. Master RX uses
+// the I2S0I_* / I2S1I_* family for DATA in (and may drive its own BCK
+// and WS for slave-clock-out style configurations).
 const (
-	gpioSigI2S0O_BCK      = 24
+	gpioSigI2S0O_BCK      = 23
 	gpioSigI2S0O_WS       = 25
-	gpioSigI2S0O_DATA_OUT = 26 // I2S0O_DATA_OUT23, used for single-channel output
-	gpioSigI2S0I_BCK      = 23
-	gpioSigI2S0I_WS       = 22
-	gpioSigI2S0I_DATA_IN  = 21 // I2S0I_DATA_IN0
-	gpioSigI2S1O_BCK      = 31
-	gpioSigI2S1O_WS       = 32
-	gpioSigI2S1O_DATA_OUT = 33 // I2S1O_DATA_OUT23
-	gpioSigI2S1I_BCK      = 30
-	gpioSigI2S1I_WS       = 29
-	gpioSigI2S1I_DATA_IN  = 28 // I2S1I_DATA_IN0
+	gpioSigI2S0O_DATA_OUT = 163 // I2S0O_DATA_OUT23, single-channel data
+	gpioSigI2S0I_DATA_IN  = 140 // I2S0I_DATA_IN0
+	gpioSigI2S1O_BCK      = 24
+	gpioSigI2S1O_WS       = 26
+	gpioSigI2S1O_DATA_OUT = 189 // I2S1O_DATA_OUT23
+	gpioSigI2S1I_DATA_IN  = 166 // I2S1I_DATA_IN0
 )
 
 var (
@@ -184,24 +186,25 @@ func (i2s *I2S) Configure(config I2SConfig) error {
 	// resulting MCLK lands at SampleRate * 64 (16 bits × 2 channels ×
 	// 2 BCK_DIV_NUM oversample = 64). The slight rounding error is
 	// acceptable for voice-band audio.
+	// Clock from PLL_F160M. The peripheral emits 32 BCK per LRCK frame
+	// (16-bit × 2 slots), so MCLK = sample_rate × 32 × bck_div_num.
+	// With bck_div_num=2 the integer divider for a 16 kHz sample rate
+	// against the 160 MHz source lands at 156.
 	const mclkBase uint32 = 160_000_000
-	const mclkMult uint32 = 64
-	mclkTarget := config.AudioFrequency * mclkMult
+	const bckDiv uint32 = 2
+	const slotBits uint32 = 32
+	mclkTarget := config.AudioFrequency * slotBits * bckDiv
 	div := mclkBase / mclkTarget
 	if div < 2 {
 		div = 2
 	}
-	println("i2s: cfg.AudioFreq=", config.AudioFrequency, " mclkTarget=", mclkTarget, " div=", div)
 	i2s.Bus.SetCLKM_CONF_CLK_EN(1)
 	i2s.Bus.SetCLKM_CONF_CLKA_ENA(0)
 	i2s.Bus.SetCLKM_CONF_CLKM_DIV_NUM(div)
-	println("i2s: post DIV_NUM write, read back=", i2s.Bus.GetCLKM_CONF_CLKM_DIV_NUM())
-	i2s.Bus.SetCLKM_CONF_CLKM_DIV_A(63)
-	println("i2s: post DIV_A write, DIV_NUM read back=", i2s.Bus.GetCLKM_CONF_CLKM_DIV_NUM())
+	i2s.Bus.SetCLKM_CONF_CLKM_DIV_A(1)
 	i2s.Bus.SetCLKM_CONF_CLKM_DIV_B(0)
-	println("i2s: post DIV_B write, DIV_NUM read back=", i2s.Bus.GetCLKM_CONF_CLKM_DIV_NUM())
-	i2s.Bus.SetSAMPLE_RATE_CONF_TX_BCK_DIV_NUM(2)
-	i2s.Bus.SetSAMPLE_RATE_CONF_RX_BCK_DIV_NUM(2)
+	i2s.Bus.SetSAMPLE_RATE_CONF_TX_BCK_DIV_NUM(bckDiv)
+	i2s.Bus.SetSAMPLE_RATE_CONF_RX_BCK_DIV_NUM(bckDiv)
 
 	// Route signals through IO matrix using the existing Pin.configure
 	// helper, which sets the IO_MUX function to GPIO, enables the
@@ -227,15 +230,17 @@ func (i2s *I2S) Configure(config I2SConfig) error {
 }
 
 // SetSampleFrequency updates the sample rate. Configure must have been
-// called first.
+// called first; the bit clock divider and framing settled by Configure
+// are reused, so the supported range is the same.
 func (i2s *I2S) SetSampleFrequency(freq uint32) error {
 	if !i2sFreqSupported(freq) {
 		return errI2SBadFreq
 	}
 	i2s.conf.AudioFrequency = freq
 	const mclkBase uint32 = 160_000_000
-	const mclkMult uint32 = 64
-	mclkTarget := freq * mclkMult
+	const bckDiv uint32 = 2
+	const slotBits uint32 = 32
+	mclkTarget := freq * slotBits * bckDiv
 	div := mclkBase / mclkTarget
 	if div < 2 {
 		div = 2
@@ -274,16 +279,16 @@ func (i2s *I2S) WriteMono(b []uint16) (int, error) {
 			samplesThisRound = len(b) - written
 		}
 		// FIFO_MOD=1 (16-bit mono) consumes one 16-bit sample per
-		// 32-bit DMA word; the upper 16 bits are ignored, but we
-		// duplicate them so a future switch to FIFO_MOD=0 dual
-		// channel doesn't change the audio.
+		// 32-bit DMA word, placed in the low half. The high half is
+		// not used; duplicating the sample into both halves causes
+		// the peripheral to play each sample twice and doubles the
+		// effective pitch.
 		for i := 0; i < samplesThisRound; i++ {
 			s := uint32(b[written+i])
-			frame := (s << 16) | s
-			slot[i*4+0] = byte(frame)
-			slot[i*4+1] = byte(frame >> 8)
-			slot[i*4+2] = byte(frame >> 16)
-			slot[i*4+3] = byte(frame >> 24)
+			slot[i*4+0] = byte(s)
+			slot[i*4+1] = byte(s >> 8)
+			slot[i*4+2] = 0
+			slot[i*4+3] = 0
 		}
 		bytesThisRound := uint32(samplesThisRound * 4)
 		i2s.dma.flags = bytesThisRound | (bytesThisRound << 12) | i2sDescEOF | i2sDescOwnerDMA
@@ -347,23 +352,29 @@ func (i2s *I2S) txSignals() (bck, ws, data uint32) {
 }
 
 func (i2s *I2S) armOutLink() {
-	// Match the canonical ESP-IDF tx-channel start sequence: reset TX
-	// path + FIFO, re-enable the OUT_EOF interrupt status path, then
-	// program OUT_LINK.addr | start in one combined write. Splitting
-	// addr/start writes can leave OUT_LINK inconsistent (DMA flagged
-	// OUT_DSCR_ERR during early bring-up); writing the field-bundle
-	// together avoids it.
-	i2s.Bus.SetCONF_TX_RESET(1)
-	i2s.Bus.SetCONF_TX_RESET(0)
-	i2s.Bus.SetLC_CONF_OUT_RST(1)
-	i2s.Bus.SetLC_CONF_OUT_RST(0)
-	i2s.Bus.SetCONF_TX_FIFO_RESET(1)
-	i2s.Bus.SetCONF_TX_FIFO_RESET(0)
-	i2s.Bus.SetINT_ENA_OUT_EOF_INT_ENA(1)
-	i2s.Bus.SetFIFO_CONF_DSCR_EN(1)
+	// First arm: full reset + program OUT_LINK with addr|start in one
+	// store. Subsequent arms: just OUT_LINK restart (DMA parks when
+	// OWNER bit flips back to CPU after an EOF; restart resumes it
+	// once we have re-filled the buffer). Resetting TX or FIFO on
+	// every round produces an audible pulse / vibrato as the I2S
+	// state machine restarts mid-stream.
 	addr := uint32(uintptr(unsafe.Pointer(&i2s.dma))) & 0xfffff
-	const outLinkStart = uint32(1 << 29)
-	i2s.Bus.OUT_LINK.Set(addr | outLinkStart)
+	if !i2s.dmaPrimed {
+		i2s.Bus.SetCONF_TX_RESET(1)
+		i2s.Bus.SetCONF_TX_RESET(0)
+		i2s.Bus.SetLC_CONF_OUT_RST(1)
+		i2s.Bus.SetLC_CONF_OUT_RST(0)
+		i2s.Bus.SetCONF_TX_FIFO_RESET(1)
+		i2s.Bus.SetCONF_TX_FIFO_RESET(0)
+		i2s.Bus.SetINT_ENA_OUT_EOF_INT_ENA(1)
+		i2s.Bus.SetFIFO_CONF_DSCR_EN(1)
+		const outLinkStart = uint32(1 << 29)
+		i2s.Bus.OUT_LINK.Set(addr | outLinkStart)
+		i2s.dmaPrimed = true
+	} else {
+		const outLinkRestart = uint32(1 << 30)
+		i2s.Bus.OUT_LINK.Set(addr | outLinkRestart)
+	}
 	i2s.Bus.SetINT_CLR_OUT_EOF_INT_CLR(1)
 	i2s.Bus.SetINT_CLR_OUT_DSCR_ERR_INT_CLR(1)
 }
