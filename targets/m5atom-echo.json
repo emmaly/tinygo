@@ -1,0 +1,5 @@
+{
+	"inherits": ["esp32"],
+	"build-tags": ["m5atom_echo"],
+	"serial-port": ["0403:6001", "10c4:ea60", "1a86:55d4"]
+}
