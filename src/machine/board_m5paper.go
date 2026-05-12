@@ -97,8 +97,8 @@ const (
 
 // DAC pins
 const (
-	DAC1 Pin = IO25
-	DAC2 Pin = IO26
+	DAC1_OUT Pin = IO25
+	DAC2_OUT Pin = IO26
 )
 
 // UART pins
