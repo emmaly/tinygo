@@ -160,15 +160,39 @@ func (i2s *I2S) Configure(config I2SConfig) error {
 	i2s.Bus.SetCONF1_TX_STOP_EN(0)
 
 	// Force into standard I2S framing. After reset CONF2 and PDM_CONF
-	// may carry stale bits that route the TX path through the parallel
-	// LCD or PDM data paths; without explicitly clearing them the FIFO
-	// is wired to the wrong output. This matches ESP-IDF's
-	// i2s_ll_tx_enable_std / i2s_ll_rx_enable_std for the ESP32.
+	// may carry stale bits that route the data path through the LCD or
+	// PDM hardware; clear them now and only set the PDM bits later if
+	// the caller requested I2SModePDM.
 	i2s.Bus.CONF2.Set(0)
 	i2s.Bus.SetPDM_CONF_TX_PDM_EN(0)
 	i2s.Bus.SetPDM_CONF_PCM2PDM_CONV_EN(0)
 	i2s.Bus.SetPDM_CONF_RX_PDM_EN(0)
 	i2s.Bus.SetPDM_CONF_PDM2PCM_CONV_EN(0)
+
+	rxMode := config.Mode == I2SModeReceiver || config.Mode == I2SModePDM
+	if rxMode {
+		// RX path setup: master mode so the peripheral generates the
+		// PDM clock on the WS pin, mono-mode frame, 16-bit PCM samples
+		// post-decimation in the FIFO.
+		i2s.Bus.SetCONF_RX_SLAVE_MOD(0)
+		i2s.Bus.SetCONF_RX_MSB_SHIFT(1)
+		i2s.Bus.SetCONF_RX_RIGHT_FIRST(0)
+		i2s.Bus.SetCONF_RX_SHORT_SYNC(0)
+		i2s.Bus.SetFIFO_CONF_RX_FIFO_MOD(0)
+		i2s.Bus.SetFIFO_CONF_RX_FIFO_MOD_FORCE_EN(1)
+		i2s.Bus.SetCONF_CHAN_RX_CHAN_MOD(0)
+		if config.Mode == I2SModePDM {
+			// Enable the PDM hardware decimator. PDM bitstream
+			// arrives at PDM_CLK × oversample rate on the data
+			// line; the hardware decimates it to PCM at
+			// AudioFrequency before placing the result in FIFO.
+			i2s.Bus.SetPDM_CONF_RX_PDM_EN(1)
+			i2s.Bus.SetPDM_CONF_PDM2PCM_CONV_EN(1)
+			// Downsample ratio: 0 = /64, 1 = /128. /64 yields a
+			// 16 kHz output rate from a 1.024 MHz PDM clock.
+			i2s.Bus.SetPDM_CONF_RX_PDM_SINC_DSR_16_EN(0)
+		}
+	}
 
 	// FIFO: try 16-bit dual-channel (TX_FIFO_MOD=0) so each DMA word
 	// carries an [L | R] frame. Mono single-slot (FIFO_MOD=1) appeared
@@ -205,14 +229,28 @@ func (i2s *I2S) Configure(config I2SConfig) error {
 	// against the 160 MHz PLL_F160M source this lands DIV_NUM = 39
 	// and TX_BCK_DIV_NUM = 8 (the peripheral rejects bclk_div < 8).
 	const mclkBase uint32 = 160_000_000
-	const mclkMultiple uint32 = 256
-	const totalSlot uint32 = 2
-	const slotBits uint32 = 16
-	mclk := config.AudioFrequency * mclkMultiple
-	bclk := config.AudioFrequency * totalSlot * slotBits
-	bckDiv := mclk / bclk
-	if bckDiv < 8 {
-		bckDiv = 8
+	var mclk uint32
+	var bckDiv uint32 = 8
+	if config.Mode == I2SModePDM {
+		// PDM RX clock formula from ESP-IDF i2s_calculate_pdm_rx_clock:
+		//   bclk = sample_rate × PDM_BCK_FACTOR (64)
+		//   mclk = bclk × bclk_div  (bclk_div = 8 default)
+		// So mclk = sample_rate × 64 × 8 = sample_rate × 512.
+		mclk = config.AudioFrequency * 64 * bckDiv
+	} else {
+		// Standard I2S TX/RX clock formula from i2s_std.c:
+		//   bclk = sample_rate × total_slot × slot_bits
+		//   mclk = sample_rate × mclk_multiple  (= 256)
+		//   bclk_div = mclk / bclk = 8 for 16-bit stereo at any rate
+		const mclkMultiple uint32 = 256
+		const totalSlot uint32 = 2
+		const slotBits uint32 = 16
+		mclk = config.AudioFrequency * mclkMultiple
+		bclk := config.AudioFrequency * totalSlot * slotBits
+		bckDiv = mclk / bclk
+		if bckDiv < 8 {
+			bckDiv = 8
+		}
 	}
 	div := mclkBase / mclk
 	if div < 2 {
@@ -226,32 +264,54 @@ func (i2s *I2S) Configure(config I2SConfig) error {
 	i2s.Bus.SetSAMPLE_RATE_CONF_TX_BCK_DIV_NUM(bckDiv)
 	i2s.Bus.SetSAMPLE_RATE_CONF_RX_BCK_DIV_NUM(bckDiv)
 
-	// Route signals through IO matrix using the existing Pin.configure
-	// helper, which sets the IO_MUX function to GPIO, enables the
-	// output, and writes the peripheral signal index to the per-pin
-	// FUNCx_OUT_SEL_CFG register in one step.
-	bckSig, wsSig, dataSig := i2s.txSignals()
-	if config.SCK != NoPin {
-		config.SCK.configure(PinConfig{Mode: PinOutput}, bckSig)
-	}
-	if config.WS != NoPin {
-		config.WS.configure(PinConfig{Mode: PinOutput}, wsSig)
-	}
-	if config.SDO != NoPin {
-		config.SDO.configure(PinConfig{Mode: PinOutput}, dataSig)
+	// Route signals through the IO matrix. For TX mode all three I2S
+	// signals are driven outputs; for PDM RX the WS pin becomes the
+	// PDM clock output and the data line is the PDM input from the
+	// microphone.
+	if config.Mode == I2SModePDM {
+		// PDM clock output on the WS pin, PDM data input on SDI.
+		wsSig := i2s.pdmClockOutSignal()
+		if config.WS != NoPin {
+			config.WS.configure(PinConfig{Mode: PinOutput}, wsSig)
+		}
+		if config.SDI != NoPin {
+			config.SDI.configure(PinConfig{Mode: PinInput}, i2s.rxDataInSignal())
+		}
+	} else {
+		bckSig, wsSig, dataSig := i2s.txSignals()
+		if config.SCK != NoPin {
+			config.SCK.configure(PinConfig{Mode: PinOutput}, bckSig)
+		}
+		if config.WS != NoPin {
+			config.WS.configure(PinConfig{Mode: PinOutput}, wsSig)
+		}
+		if config.SDO != NoPin {
+			config.SDO.configure(PinConfig{Mode: PinOutput}, dataSig)
+		}
 	}
 
 	// Prep DMA descriptor ring. Each descriptor points at its own
 	// buffer and links to the next; the last descriptor links back
 	// to the first, so the DMA controller cycles through them
-	// indefinitely. All start in software-owned state with the
-	// full buffer pre-zeroed so the first arm sends silence rather
-	// than uninitialised memory.
+	// indefinitely. Initial descriptor state depends on direction:
+	//
+	//   TX: CPU pre-fills length=size so DMA sends the full silence
+	//       buffer; the buffer is zeroed so the first emission is
+	//       silence rather than uninitialised memory.
+	//   RX: length=0 so the DMA controller can write up to size
+	//       bytes into the buffer before raising the EOF interrupt.
+	//       Setting length=size at init would make DMA see the
+	//       descriptor as already-full and fire EOF immediately.
+	rxMode2 := config.Mode == I2SModeReceiver || config.Mode == I2SModePDM
+	initLength := uint32(i2sDMABufBytes)
+	if rxMode2 {
+		initLength = 0
+	}
 	for i := range i2s.dma {
 		i2s.dma[i].buf = &i2s.dmaBuf[i][0]
 		next := (i + 1) % i2sDMADescCount
 		i2s.dma[i].next = &i2s.dma[next]
-		i2s.dma[i].flags = uint32(i2sDMABufBytes) | (uint32(i2sDMABufBytes) << 12) | i2sDescEOF | i2sDescOwnerDMA
+		i2s.dma[i].flags = uint32(i2sDMABufBytes) | (initLength << 12) | i2sDescEOF | i2sDescOwnerDMA
 		for b := range i2s.dmaBuf[i] {
 			i2s.dmaBuf[i][b] = 0
 		}
@@ -397,14 +457,123 @@ func (i2s *I2S) WriteStereo(b []uint32) (int, error) {
 	return written, nil
 }
 
-// ReadMono is not yet implemented for ESP32 I2S.
+// ReadMono blocks until len(b) 16-bit samples have been captured from
+// the configured RX path. Configure must have been called with Mode
+// I2SModeReceiver or I2SModePDM.
+//
+// The DMA ring is shared with the TX path; only one direction can be
+// active per I2S instance.
 func (i2s *I2S) ReadMono(b []uint16) (int, error) {
-	return 0, errors.New("i2s: ReadMono not implemented on ESP32 yet")
+	if i2s.dmaBusy {
+		return 0, errI2SBusy
+	}
+	if i2s.conf.Mode != I2SModeReceiver && i2s.conf.Mode != I2SModePDM {
+		return 0, errI2SBadConfig
+	}
+	const samplesPerDesc = i2sDMABufBytes / 4
+	if !i2s.dmaPrimed {
+		i2s.armInLink()
+		// Enabling TX_START alongside RX_START keeps the master
+		// clock generator producing BCK/WS for the PDM mic. With
+		// only RX_START set the peripheral leaves the WS pin idle
+		// and the SPM1423 sees no clock.
+		i2s.Bus.SetCONF_RX_START(1)
+		i2s.Bus.SetCONF_TX_START(1)
+	}
+	read := 0
+	for read < len(b) {
+		if err := i2s.waitRXEOF(); err != nil {
+			return read, err
+		}
+		samplesThisRound := samplesPerDesc
+		if samplesThisRound > len(b)-read {
+			samplesThisRound = len(b) - read
+		}
+		slot := &i2s.dmaBuf[i2s.dmaIdx]
+		// FIFO_MOD=0 with mono PDM input: each 32-bit DMA word
+		// holds a 16-bit PCM sample in one half (the half depends
+		// on which slot the PDM hardware writes to; we copy the
+		// non-zero half by reading the low 16 bits and falling back
+		// to the high 16 bits when the low half is zero).
+		// PDM data lands on the right channel slot; take the high
+		// 16 bits of each 32-bit DMA word. The low half is the
+		// (silent) left channel.
+		for i := 0; i < samplesThisRound; i++ {
+			b[read+i] = uint16(slot[i*4+2]) | uint16(slot[i*4+3])<<8
+		}
+		// Hand the descriptor back to DMA with length cleared so the
+		// hardware can write a fresh frame into the buffer.
+		i2s.dma[i2s.dmaIdx].flags = uint32(i2sDMABufBytes) | i2sDescEOF | i2sDescOwnerDMA
+		read += samplesThisRound
+		i2s.dmaIdx = (i2s.dmaIdx + 1) % i2sDMADescCount
+	}
+	return read, nil
 }
 
-// ReadStereo is not yet implemented for ESP32 I2S.
+// ReadStereo blocks until len(b) 32-bit stereo samples have been
+// captured.
 func (i2s *I2S) ReadStereo(b []uint32) (int, error) {
-	return 0, errors.New("i2s: ReadStereo not implemented on ESP32 yet")
+	if i2s.dmaBusy {
+		return 0, errI2SBusy
+	}
+	if i2s.conf.Mode != I2SModeReceiver && i2s.conf.Mode != I2SModePDM {
+		return 0, errI2SBadConfig
+	}
+	const samplesPerDesc = i2sDMABufBytes / 4
+	if !i2s.dmaPrimed {
+		i2s.armInLink()
+		// Enabling TX_START alongside RX_START keeps the master
+		// clock generator producing BCK/WS for the PDM mic. With
+		// only RX_START set the peripheral leaves the WS pin idle
+		// and the SPM1423 sees no clock.
+		i2s.Bus.SetCONF_RX_START(1)
+		i2s.Bus.SetCONF_TX_START(1)
+	}
+	read := 0
+	for read < len(b) {
+		if err := i2s.waitRXEOF(); err != nil {
+			return read, err
+		}
+		samplesThisRound := samplesPerDesc
+		if samplesThisRound > len(b)-read {
+			samplesThisRound = len(b) - read
+		}
+		slot := &i2s.dmaBuf[i2s.dmaIdx]
+		for i := 0; i < samplesThisRound; i++ {
+			b[read+i] = uint32(slot[i*4+0]) | uint32(slot[i*4+1])<<8 |
+				uint32(slot[i*4+2])<<16 | uint32(slot[i*4+3])<<24
+		}
+		i2s.dma[i2s.dmaIdx].flags = uint32(i2sDMABufBytes) | i2sDescEOF | i2sDescOwnerDMA
+		read += samplesThisRound
+		i2s.dmaIdx = (i2s.dmaIdx + 1) % i2sDMADescCount
+	}
+	return read, nil
+}
+
+func (i2s *I2S) armInLink() {
+	i2s.Bus.SetCONF_RX_RESET(1)
+	i2s.Bus.SetCONF_RX_RESET(0)
+	i2s.Bus.SetLC_CONF_IN_RST(1)
+	i2s.Bus.SetLC_CONF_IN_RST(0)
+	i2s.Bus.SetCONF_RX_FIFO_RESET(1)
+	i2s.Bus.SetCONF_RX_FIFO_RESET(0)
+	i2s.Bus.SetINT_ENA_IN_SUC_EOF_INT_ENA(1)
+	i2s.Bus.SetFIFO_CONF_DSCR_EN(1)
+	addr := uint32(uintptr(unsafe.Pointer(&i2s.dma[0]))) & 0xfffff
+	const inLinkStart = uint32(1 << 29)
+	i2s.Bus.IN_LINK.Set(addr | inLinkStart)
+	i2s.Bus.SetINT_CLR_IN_SUC_EOF_INT_CLR(1)
+	i2s.Bus.SetINT_CLR_IN_DSCR_ERR_INT_CLR(1)
+	i2s.dmaPrimed = true
+}
+
+func (i2s *I2S) waitRXEOF() error {
+	for {
+		if i2s.Bus.GetINT_RAW_IN_SUC_EOF_INT_RAW() != 0 {
+			i2s.Bus.SetINT_CLR_IN_SUC_EOF_INT_CLR(1)
+			return nil
+		}
+	}
 }
 
 func (i2s *I2S) txSignals() (bck, ws, data uint32) {
@@ -412,6 +581,23 @@ func (i2s *I2S) txSignals() (bck, ws, data uint32) {
 		return gpioSigI2S0O_BCK, gpioSigI2S0O_WS, gpioSigI2S0O_DATA_OUT
 	}
 	return gpioSigI2S1O_BCK, gpioSigI2S1O_WS, gpioSigI2S1O_DATA_OUT
+}
+
+// pdmClockOutSignal returns the GPIO-matrix index for the PDM clock
+// output. The peripheral emits the PDM clock on the I2S{n}O_WS_OUT
+// signal in PDM RX mode.
+func (i2s *I2S) pdmClockOutSignal() uint32 {
+	if i2s.id == 0 {
+		return gpioSigI2S0O_WS
+	}
+	return gpioSigI2S1O_WS
+}
+
+func (i2s *I2S) rxDataInSignal() uint32 {
+	if i2s.id == 0 {
+		return gpioSigI2S0I_DATA_IN
+	}
+	return gpioSigI2S1I_DATA_IN
 }
 
 func (i2s *I2S) armOutLink() {
