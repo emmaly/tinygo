@@ -161,23 +161,19 @@ func (i2s *I2S) Configure(config I2SConfig) error {
 	i2s.Bus.SetPDM_CONF_RX_PDM_EN(0)
 	i2s.Bus.SetPDM_CONF_PDM2PCM_CONV_EN(0)
 
-	// FIFO: 16-bit mono mode. tx_fifo_mod=1 selects 16-bit mono so the
-	// DMA-supplied 32-bit word carries a single 16-bit sample (high
-	// half ignored by hardware) and the peripheral duplicates / steers
-	// onto whichever I2S slot is selected by CONF_CHAN.TX_CHAN_MOD.
-	// This matches the M5Stack Atom Echo Arduino driver, which uses
-	// I2S_CHANNEL_FMT_ONLY_RIGHT to feed the NS4168 amp that listens on
-	// the right channel.
-	i2s.Bus.SetFIFO_CONF_TX_FIFO_MOD(1)
+	// FIFO: try 16-bit dual-channel (TX_FIFO_MOD=0) so each DMA word
+	// carries an [L | R] frame. Mono single-slot (FIFO_MOD=1) appeared
+	// to push the peripheral through frames 8× faster than expected.
+	i2s.Bus.SetFIFO_CONF_TX_FIFO_MOD(0)
 	i2s.Bus.SetFIFO_CONF_TX_FIFO_MOD_FORCE_EN(1)
 	i2s.Bus.SetFIFO_CONF_DSCR_EN(1)
 	i2s.Bus.SetFIFO_CONF_TX_DATA_NUM(32)
 	i2s.Bus.SetFIFO_CONF_RX_DATA_NUM(32)
 
-	// CONF_CHAN: TX_CHAN_MOD = 1 = output mono samples on the right
-	// slot of the stereo I2S frame. ESP-IDF's i2s_ll_tx_select_std_slot
-	// uses the same value for non-mono I2S_STD_SLOT_RIGHT.
-	i2s.Bus.SetCONF_CHAN_TX_CHAN_MOD(1)
+	// CONF_CHAN: TX_CHAN_MOD=0 = dual-channel stereo (matches
+	// FIFO_MOD=0 above; both halves of each DMA word land on the
+	// wire).
+	i2s.Bus.SetCONF_CHAN_TX_CHAN_MOD(0)
 	i2s.Bus.SetCONF_CHAN_RX_CHAN_MOD(0)
 	i2s.Bus.SetSAMPLE_RATE_CONF_TX_BITS_MOD(16)
 	i2s.Bus.SetSAMPLE_RATE_CONF_RX_BITS_MOD(16)
@@ -186,15 +182,30 @@ func (i2s *I2S) Configure(config I2SConfig) error {
 	// resulting MCLK lands at SampleRate * 64 (16 bits × 2 channels ×
 	// 2 BCK_DIV_NUM oversample = 64). The slight rounding error is
 	// acceptable for voice-band audio.
-	// Clock from PLL_F160M. The peripheral emits 32 BCK per LRCK frame
-	// (16-bit × 2 slots), so MCLK = sample_rate × 32 × bck_div_num.
-	// With bck_div_num=2 the integer divider for a 16 kHz sample rate
-	// against the 160 MHz source lands at 156.
+	// Clock formula from ESP-IDF i2s_std.c i2s_std_calculate_clock:
+	//
+	//   bclk  = sample_rate × total_slot × slot_bits
+	//   mclk  = sample_rate × mclk_multiple
+	//   bclk_div = mclk / bclk
+	//   mclk_div = sclk / mclk    (the ESP32 CLKM_DIV_NUM field)
+	//
+	// Both slots are always clocked through (the unused mono slot is
+	// not trimmed), so total_slot = 2 and slot_bits = 16 for the
+	// 16-bit mono / stereo settings used here. mclk_multiple = 256 is
+	// a standard audio oversample ratio. For sample_rate = 16 kHz
+	// against the 160 MHz PLL_F160M source this lands DIV_NUM = 39
+	// and TX_BCK_DIV_NUM = 8 (the peripheral rejects bclk_div < 8).
 	const mclkBase uint32 = 160_000_000
-	const bckDiv uint32 = 2
-	const slotBits uint32 = 32
-	mclkTarget := config.AudioFrequency * slotBits * bckDiv
-	div := mclkBase / mclkTarget
+	const mclkMultiple uint32 = 256
+	const totalSlot uint32 = 2
+	const slotBits uint32 = 16
+	mclk := config.AudioFrequency * mclkMultiple
+	bclk := config.AudioFrequency * totalSlot * slotBits
+	bckDiv := mclk / bclk
+	if bckDiv < 8 {
+		bckDiv = 8
+	}
+	div := mclkBase / mclk
 	if div < 2 {
 		div = 2
 	}
@@ -238,14 +249,22 @@ func (i2s *I2S) SetSampleFrequency(freq uint32) error {
 	}
 	i2s.conf.AudioFrequency = freq
 	const mclkBase uint32 = 160_000_000
-	const bckDiv uint32 = 2
-	const slotBits uint32 = 32
-	mclkTarget := freq * slotBits * bckDiv
-	div := mclkBase / mclkTarget
+	const mclkMultiple uint32 = 256
+	const totalSlot uint32 = 2
+	const slotBits uint32 = 16
+	mclk := freq * mclkMultiple
+	bclk := freq * totalSlot * slotBits
+	bckDiv := mclk / bclk
+	if bckDiv < 8 {
+		bckDiv = 8
+	}
+	div := mclkBase / mclk
 	if div < 2 {
 		div = 2
 	}
 	i2s.Bus.SetCLKM_CONF_CLKM_DIV_NUM(div)
+	i2s.Bus.SetSAMPLE_RATE_CONF_TX_BCK_DIV_NUM(bckDiv)
+	i2s.Bus.SetSAMPLE_RATE_CONF_RX_BCK_DIV_NUM(bckDiv)
 	return nil
 }
 
@@ -278,17 +297,17 @@ func (i2s *I2S) WriteMono(b []uint16) (int, error) {
 		if samplesThisRound > len(b)-written {
 			samplesThisRound = len(b) - written
 		}
-		// FIFO_MOD=1 (16-bit mono) consumes one 16-bit sample per
-		// 32-bit DMA word, placed in the low half. The high half is
-		// not used; duplicating the sample into both halves causes
-		// the peripheral to play each sample twice and doubles the
-		// effective pitch.
+		// FIFO_MOD=0 (16-bit dual channel) packs one frame as
+		// [right][left] in low 16 / high 16 bits. Duplicate the
+		// mono sample to both slots so the NS4168 (right-channel
+		// amp) gets it regardless of slot mask.
 		for i := 0; i < samplesThisRound; i++ {
 			s := uint32(b[written+i])
-			slot[i*4+0] = byte(s)
-			slot[i*4+1] = byte(s >> 8)
-			slot[i*4+2] = 0
-			slot[i*4+3] = 0
+			frame := (s << 16) | s
+			slot[i*4+0] = byte(frame)
+			slot[i*4+1] = byte(frame >> 8)
+			slot[i*4+2] = byte(frame >> 16)
+			slot[i*4+3] = byte(frame >> 24)
 		}
 		bytesThisRound := uint32(samplesThisRound * 4)
 		i2s.dma.flags = bytesThisRound | (bytesThisRound << 12) | i2sDescEOF | i2sDescOwnerDMA
