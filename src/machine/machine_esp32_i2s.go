@@ -26,16 +26,25 @@ type I2S struct {
 	id   uint8 // 0 = I2S0, 1 = I2S1
 	conf I2SConfig
 
-	dma       i2sDMADesc
-	dmaBuf    [i2sDMABufBytes]byte
+	dma       [i2sDMADescCount]i2sDMADesc
+	dmaBuf    [i2sDMADescCount][i2sDMABufBytes]byte
+	dmaIdx    int // next descriptor index to fill
 	dmaBusy   bool
 	dmaPrimed bool
 }
 
-// i2sDMABufBytes is the on-chip buffer used by a single DMA descriptor.
-// It is large enough to hold one millisecond of 48 kHz stereo 16-bit
-// audio plus headroom (4 * 48 = 192 bytes minimum, rounded up).
-const i2sDMABufBytes = 1024
+// I2S DMA ring: a fixed number of self-linked descriptors that the
+// DMA controller cycles through continuously. With a single-descriptor
+// arrangement the peripheral FIFO drains during the time between
+// WriteMono calls and the NS4168 amp on Atom Echo interprets the
+// resulting silence as "stop" and ramps its output down, which kills
+// the perceived volume of subsequent buffers. A 4-descriptor ring
+// keeps the FIFO continuously fed while the CPU is refilling the
+// descriptor that was just emptied.
+const (
+	i2sDMADescCount = 4
+	i2sDMABufBytes  = 512
+)
 
 // I2S DMA descriptor as expected by the ESP32 DMA controller. Layout
 // and field placement is fixed by hardware; do not reorder.
@@ -232,10 +241,23 @@ func (i2s *I2S) Configure(config I2SConfig) error {
 		config.SDO.configure(PinConfig{Mode: PinOutput}, dataSig)
 	}
 
-	// Prep DMA descriptor as self-linked single buffer.
-	i2s.dma.buf = &i2s.dmaBuf[0]
-	i2s.dma.next = &i2s.dma
-	i2s.dma.flags = uint32(i2sDMABufBytes) | (uint32(i2sDMABufBytes) << 12) | i2sDescEOF | i2sDescOwnerCPU
+	// Prep DMA descriptor ring. Each descriptor points at its own
+	// buffer and links to the next; the last descriptor links back
+	// to the first, so the DMA controller cycles through them
+	// indefinitely. All start in software-owned state with the
+	// full buffer pre-zeroed so the first arm sends silence rather
+	// than uninitialised memory.
+	for i := range i2s.dma {
+		i2s.dma[i].buf = &i2s.dmaBuf[i][0]
+		next := (i + 1) % i2sDMADescCount
+		i2s.dma[i].next = &i2s.dma[next]
+		i2s.dma[i].flags = uint32(i2sDMABufBytes) | (uint32(i2sDMABufBytes) << 12) | i2sDescEOF | i2sDescOwnerDMA
+		for b := range i2s.dmaBuf[i] {
+			i2s.dmaBuf[i][b] = 0
+		}
+	}
+	i2s.dmaIdx = 0
+	i2s.dmaPrimed = false
 
 	return nil
 }
@@ -281,26 +303,35 @@ func (i2s *I2S) Enable(enabled bool) {
 }
 
 // WriteMono blocks until len(b) 16-bit samples have been streamed out
-// on the configured TX pins. The same sample is duplicated on both L
-// and R slots of the I2S frame.
+// on the configured TX pins. The mono sample is duplicated into both
+// slots of each stereo frame.
+//
+// The DMA controller continuously cycles through the descriptor ring
+// initialised in Configure. Each iteration here waits for the next
+// OUT_EOF interrupt (DMA finished a buffer), then overwrites the
+// buffer DMA just finished with the next chunk of samples and hands
+// the descriptor back to DMA. As long as the CPU is faster than the
+// audio bit rate (true at any reasonable sample rate on the ESP32)
+// the peripheral never sees a silent gap.
 func (i2s *I2S) WriteMono(b []uint16) (int, error) {
 	if i2s.dmaBusy {
 		return 0, errI2SBusy
 	}
+	const samplesPerDesc = i2sDMABufBytes / 4
+	if !i2s.dmaPrimed {
+		i2s.armOutLink()
+		i2s.Bus.SetCONF_TX_START(1)
+	}
 	written := 0
 	for written < len(b) {
-		// Each DMA buffer slot holds a 32-bit stereo frame: low 16
-		// bits = right, high 16 bits = left. For mono output we put
-		// the same value in both halves.
-		slot := i2s.dmaBuf[:]
-		samplesThisRound := (i2sDMABufBytes / 4)
+		if err := i2s.waitTXEOF(); err != nil {
+			return written, err
+		}
+		samplesThisRound := samplesPerDesc
 		if samplesThisRound > len(b)-written {
 			samplesThisRound = len(b) - written
 		}
-		// FIFO_MOD=0 (16-bit dual channel) packs one frame as
-		// [right][left] in low 16 / high 16 bits. Duplicate the
-		// mono sample to both slots so the NS4168 (right-channel
-		// amp) gets it regardless of slot mask.
+		slot := &i2s.dmaBuf[i2s.dmaIdx]
 		for i := 0; i < samplesThisRound; i++ {
 			s := uint32(b[written+i])
 			frame := (s << 16) | s
@@ -310,13 +341,15 @@ func (i2s *I2S) WriteMono(b []uint16) (int, error) {
 			slot[i*4+3] = byte(frame >> 24)
 		}
 		bytesThisRound := uint32(samplesThisRound * 4)
-		i2s.dma.flags = bytesThisRound | (bytesThisRound << 12) | i2sDescEOF | i2sDescOwnerDMA
-		i2s.armOutLink()
-		i2s.Bus.SetCONF_TX_START(1)
-		if err := i2s.waitTXEOF(); err != nil {
-			return written, err
-		}
+		// length field tells the DMA controller how many bytes to
+		// stream out before raising OUT_EOF; capacity stays the full
+		// buffer size so the descriptor is reusable for larger
+		// chunks. With length<size the descriptor never advances
+		// past the valid data, so unused tail bytes are not
+		// transmitted as silence.
+		i2s.dma[i2s.dmaIdx].flags = uint32(i2sDMABufBytes) | (bytesThisRound << 12) | i2sDescEOF | i2sDescOwnerDMA
 		written += samplesThisRound
+		i2s.dmaIdx = (i2s.dmaIdx + 1) % i2sDMADescCount
 	}
 	return written, nil
 }
@@ -328,27 +361,38 @@ func (i2s *I2S) WriteStereo(b []uint32) (int, error) {
 	if i2s.dmaBusy {
 		return 0, errI2SBusy
 	}
-	written := 0
-	for written < len(b) {
-		samplesThisRound := (i2sDMABufBytes / 4)
-		if samplesThisRound > len(b)-written {
-			samplesThisRound = len(b) - written
-		}
-		for i := 0; i < samplesThisRound; i++ {
-			frame := b[written+i]
-			i2s.dmaBuf[i*4+0] = byte(frame)
-			i2s.dmaBuf[i*4+1] = byte(frame >> 8)
-			i2s.dmaBuf[i*4+2] = byte(frame >> 16)
-			i2s.dmaBuf[i*4+3] = byte(frame >> 24)
-		}
-		bytesThisRound := uint32(samplesThisRound * 4)
-		i2s.dma.flags = bytesThisRound | (bytesThisRound << 12) | i2sDescEOF | i2sDescOwnerDMA
+	const samplesPerDesc = i2sDMABufBytes / 4
+	if !i2s.dmaPrimed {
 		i2s.armOutLink()
 		i2s.Bus.SetCONF_TX_START(1)
+	}
+	written := 0
+	for written < len(b) {
 		if err := i2s.waitTXEOF(); err != nil {
 			return written, err
 		}
+		samplesThisRound := samplesPerDesc
+		if samplesThisRound > len(b)-written {
+			samplesThisRound = len(b) - written
+		}
+		slot := &i2s.dmaBuf[i2s.dmaIdx]
+		for i := 0; i < samplesThisRound; i++ {
+			frame := b[written+i]
+			slot[i*4+0] = byte(frame)
+			slot[i*4+1] = byte(frame >> 8)
+			slot[i*4+2] = byte(frame >> 16)
+			slot[i*4+3] = byte(frame >> 24)
+		}
+		bytesThisRound := uint32(samplesThisRound * 4)
+		// length field tells the DMA controller how many bytes to
+		// stream out before raising OUT_EOF; capacity stays the full
+		// buffer size so the descriptor is reusable for larger
+		// chunks. With length<size the descriptor never advances
+		// past the valid data, so unused tail bytes are not
+		// transmitted as silence.
+		i2s.dma[i2s.dmaIdx].flags = uint32(i2sDMABufBytes) | (bytesThisRound << 12) | i2sDescEOF | i2sDescOwnerDMA
 		written += samplesThisRound
+		i2s.dmaIdx = (i2s.dmaIdx + 1) % i2sDMADescCount
 	}
 	return written, nil
 }
@@ -371,31 +415,23 @@ func (i2s *I2S) txSignals() (bck, ws, data uint32) {
 }
 
 func (i2s *I2S) armOutLink() {
-	// First arm: full reset + program OUT_LINK with addr|start in one
-	// store. Subsequent arms: just OUT_LINK restart (DMA parks when
-	// OWNER bit flips back to CPU after an EOF; restart resumes it
-	// once we have re-filled the buffer). Resetting TX or FIFO on
-	// every round produces an audible pulse / vibrato as the I2S
-	// state machine restarts mid-stream.
-	addr := uint32(uintptr(unsafe.Pointer(&i2s.dma))) & 0xfffff
-	if !i2s.dmaPrimed {
-		i2s.Bus.SetCONF_TX_RESET(1)
-		i2s.Bus.SetCONF_TX_RESET(0)
-		i2s.Bus.SetLC_CONF_OUT_RST(1)
-		i2s.Bus.SetLC_CONF_OUT_RST(0)
-		i2s.Bus.SetCONF_TX_FIFO_RESET(1)
-		i2s.Bus.SetCONF_TX_FIFO_RESET(0)
-		i2s.Bus.SetINT_ENA_OUT_EOF_INT_ENA(1)
-		i2s.Bus.SetFIFO_CONF_DSCR_EN(1)
-		const outLinkStart = uint32(1 << 29)
-		i2s.Bus.OUT_LINK.Set(addr | outLinkStart)
-		i2s.dmaPrimed = true
-	} else {
-		const outLinkRestart = uint32(1 << 30)
-		i2s.Bus.OUT_LINK.Set(addr | outLinkRestart)
-	}
+	// One-shot arm at the head of the ring. After this the DMA
+	// controller follows the next-pointers continuously; the CPU
+	// only refills descriptors as they emit OUT_EOF.
+	i2s.Bus.SetCONF_TX_RESET(1)
+	i2s.Bus.SetCONF_TX_RESET(0)
+	i2s.Bus.SetLC_CONF_OUT_RST(1)
+	i2s.Bus.SetLC_CONF_OUT_RST(0)
+	i2s.Bus.SetCONF_TX_FIFO_RESET(1)
+	i2s.Bus.SetCONF_TX_FIFO_RESET(0)
+	i2s.Bus.SetINT_ENA_OUT_EOF_INT_ENA(1)
+	i2s.Bus.SetFIFO_CONF_DSCR_EN(1)
+	addr := uint32(uintptr(unsafe.Pointer(&i2s.dma[0]))) & 0xfffff
+	const outLinkStart = uint32(1 << 29)
+	i2s.Bus.OUT_LINK.Set(addr | outLinkStart)
 	i2s.Bus.SetINT_CLR_OUT_EOF_INT_CLR(1)
 	i2s.Bus.SetINT_CLR_OUT_DSCR_ERR_INT_CLR(1)
+	i2s.dmaPrimed = true
 }
 
 func (i2s *I2S) waitTXEOF() error {
